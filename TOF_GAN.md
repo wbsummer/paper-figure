@@ -1,133 +1,161 @@
-# 实验 11：DeepLabV3++GAN + RGST-TOFAA
+# 实验 12：DeepLabV3++GAN + RGST-TOFAA-RC
 
-本文汇总实验 11 的实际网络、模型规模与训练损失搭建，供后续绘制框架图使用。
+本文记录实验 12 的实际网络、参数规模、训练数据流与损失搭建，供后续绘制模型框架图和撰写方法章节使用。实验 12 在实验 7 的强分割基线之上，加入位于 ASPP 后的 RGST-TOFAA-RC；其核心约束是最终语义残差的 RMS 不超过原 ASPP 特征 RMS 的 10%。
 
-## 1. 网络组成与模型规模
+## 1. 网络组成与规模
 
-| 网络 | 作用 | 参数量 | FP32 参数存储 |
-|---|---|---:|---:|
-| 生成器 `DeepLabV3Plus + RGST-TOFAA` | Depth/IR → 5 类材质 logits | **41,094,343** | **156.762 MiB** |
-| 判别器 `TOFPhysicsDiscriminator` | 判别分割图是否符合当前 Depth/IR 观测 | **803,459** | **3.065 MiB** |
-| 合计 | 训练期 G + D | **41,897,802** | **159.827 MiB** |
+| 网络 | 功能 | 参数量 | FP32 参数存储 | 推理期 |
+|---|---|---:|---:|---|
+| Generator：DeepLabV3+ + RGST-TOFAA-RC | Depth/IR → 5 类 logits | **41,094,343** | **156.762 MiB** | 保留 |
+| Discriminator：TOFPhysicsDiscriminator | 判断分割是否匹配当前 Depth/IR | **803,459** | **3.065 MiB** | 不使用 |
+| 训练期合计 | G + D | **41,897,802** | **159.827 MiB** | — |
 
-参数存储不包含梯度、AdamW 优化器状态和激活图。推理期只保留生成器。
+判别器总参数包含一个未进入 `forward()` 的 20,160 参数 `material_boundary` 模块；真实前向计算路径使用 783,299 个判别器参数。模型参数存储不含梯度、AdamW 状态和中间激活。
+
+### 实验 12 版本与可训练性
+
+实验 12 当前使用 `attention_type=reliability_gated_semantic_tofaa_rc`、`rgst_max_residual_ratio=0.1` 和 TOFAA checkpoint **版本 7**。版本 7 修复了零初始化时的数值稳定性：因为 `α=0`，初始有效残差 `C=tanh(α)gΔF=0`；RMS 使用 `sqrt(mean(C²)+10^-12)`，保证第一步反向传播的所有生成器梯度均有限。旧版本 6 在 `sqrt(mean(C²))` 的零点反向会产生 NaN，AMP 会跳过整个 G 优化步，故其 checkpoint 不可恢复、不可用于推理或结果比较。
 
 ```text
-Depth + IR ─► Generator (DeepLabV3+ + RGST-TOFAA) ─► 5-class logits
-                  │                                      │
-                  │                                      └─► straight-through one-hot segmentation
-                  │                                                        │
-                  └────────────────────────────────────────────────────────┼─► Conditional Discriminator
-Depth + IR ─────────────────────────────────────────────────────────────────┘
+Depth + IR ─► Generator ─► logits ─► straight-through one-hot ─┐
+       │                                                        │
+       └────────────────────────────────────────────────────────┼─► Conditional D
+Depth + IR ──────────────────────────────────────────────────────┘
 ```
 
-生成器的 RGST-TOFAA 位于 ASPP 后的 `18 x 20` 高层语义尺度；原始 `layer1` 低层边界特征直接进入 Decoder，不经过 TOFAA 重写。判别器同时使用 5 通道分割图、Depth 与 IR，输出 `71 x 79` 的 Patch 评分图及物理不一致图。
+### 生成器主干
 
-## 2. 训练批次与时序
+```text
+B×2×576×640
+  → ResNet backbone
+  → layer4: B×2048×18×20
+  → ASPP: B×256×18×20
+  → RGST-TOFAA-RC: B×256×18×20
+  → Decoder + layer1 skip: B×5×576×640 logits
+```
 
-每个训练批次为 `B=8` 对齐的 `(Depth, IR, mask)`，空间尺寸为 `576 x 640`。训练集实际启用同步水平翻转（概率 `0.5`）、同步旋转（概率 `0.3`、角度 `±10°`）和观测驱动传感器噪声；验证与推理不应用这些增强。
+RGST-TOFAA-RC 输入为 ASPP 特征及对齐到 `18×20` 的 Depth/IR。它生成可靠性门控 `g` 和语义差分 `ΔF`，先计算：
 
-每个 epoch 内的有效顺序为：
+\[
+C=\tanh(\alpha)g\Delta F.
+\]
 
-1. epoch 0–49：只更新 G，使用分割损失；D 不进行更新。
-2. epoch 50 起：先更新 D 一次，再更新 G 一次（`d_steps_per_g=1`）。
-3. G 更新期间，D 切换到 eval 并冻结全部参数；D 仅提供对 G 的可导评分。
-4. 所有更新使用 AMP 和 L2 梯度裁剪，阈值为 `2.0`。
+然后按样本限幅：
+
+\[
+F_{out}=F_{ASPP}+sC,\quad
+s=\min\left(1,\frac{0.1\operatorname{RMS}(F_{ASPP})}{\sqrt{\operatorname{mean}(C^2)+10^{-12}}}\right).
+\]
+
+因此 `RMS(F_out − F_ASPP) ≤ 0.1 × RMS(F_ASPP)`。低层 `layer1` 特征保持原样，经 `256→48` 投影后与 `F_out` 在 Decoder 中融合。
+
+### 判别器主干
+
+```text
+[one-hot segmentation(5), Depth(1), IR(1)] = B×7×576×640
+  → Conv 7→64, stride 2
+  → Conv 64→128, stride 2 + GN
+  → Conv 128→256, stride 2 + GN
+  → Conv 256→1, stride 1
+  → Patch logits: B×1×71×79
+```
+
+并行物理支路将 Depth、IR 与 segmentation 缩放到 `144×160`，构造真实 ToF 物理表征和分割预测物理表征，得到不一致图 `P: B×1×71×79`。最终判别器输出为 `D_final=D_patch+0.3P`。
+
+## 2. 训练批次、增强与对抗时序
+
+每个批次为 `B=8` 个对齐的 `(Depth, IR, mask)`，分辨率为 `576×640`。训练集开启同步水平翻转（`0.5`）、同步旋转（`0.3`，`±10°`）和传感器观测驱动噪声；验证和推理不使用增强。
+
+当前传感器噪声配置为：
+
+| 类型 | 配置 |
+|---|---|
+| diffuse | `std=0.005` |
+| specular | `prob=0.5`，阈值 `0.92`，深度噪声 `std=0.005` |
+| subsurface | `prob=0.4`，最大 bias `0.02` |
+| multipath | `prob=0.4`，`std=0.015` |
+
+对抗训练采用先分割、后渐进对抗的时序：
+
+| Epoch | D 更新 | G 中的 GAN/物理项 |
+|---|---|---|
+| 0–49 | 不更新 | 不启用；仅分割损失 |
+| 50–98 | 每个 G step 前更新 D 一次 | 线性升温 |
+| 99 以后 | 每个 G step 前更新 D 一次 | 完整权重 |
+
+`d_steps_per_g=1`。G 更新时，D 切换为 eval 且全部参数 `requires_grad=False`；D 的前向梯度仍回传到生成分割图。训练启用 AMP、L2 梯度裁剪（最大范数 `2.0`）和 AdamW。
 
 ## 3. 生成器分割损失
 
-设生成器输出 logits 为 `z`，标注为 `y`。分割损失为：
+令生成器 logits 为 `z`、标签为 `y`，分割损失为：
 
 \[
-\mathcal{L}_{seg} = 1.0\mathcal{L}_{Dice} + 0.5\mathcal{L}_{Focal} + 1.0\mathcal{L}_{CE}^{LS}
+\mathcal{L}_{seg}=1.0\mathcal{L}_{Dice}+0.5\mathcal{L}_{Focal}+1.0\mathcal{L}_{CE}^{LS}.
 \]
 
-| 项 | 实际配置 |
+| 项 | 实际设置 |
 |---|---|
-| Dice | 权重 `1.0` |
-| Focal | 权重 `0.5`，`gamma=2.0`；配置中的 `alpha=0.25` 仅对二分类生效，因此对当前 5 类 Focal 实际不参与加权 |
-| Cross Entropy | 权重 `1.0`，标签平滑 `0.05` |
+| Dice | 权重 `1.0`，5 类 softmax Dice 平均 |
+| Focal | 权重 `0.5`，`gamma=2.0`；5 类任务中 `focal_alpha=0.25` 不参与二分类式 alpha 加权 |
+| Label-smoothed CE | 权重 `1.0`，标签平滑 `0.05` |
 | 类别权重 | 未启用（`null`） |
-| L1 / Boundary / Lovász | 未启用，权重均为 `0` |
+| L1 / Boundary / Lovász | 均关闭，权重 `0` |
+| ignore index | `255` |
 
-Dice 对 5 个类别分别在有效像素上计算 softmax Dice 后平均；忽略索引为 `255`。标签平滑 CE 对真实类别分配 `0.95` 概率，对其余 4 类各分配 `0.0125` 概率。Focal 以真实类别的 `p_t` 计算 `(1-p_t)^2[-\log(p_t)]`，再乘总权重 `0.5`。
+## 4. GAN 与物理一致性损失
 
-## 4. GAN 逐步启用策略
-
-基础 GAN 权重为 `lambda_gan=0.02`。当前 epoch 为 `e` 时：
+基础生成器对抗权重为 `lambda_gan=0.02`，开始 epoch 为 50，升温长度为 50：
 
 \[
 w_{gan}(e)=
 \begin{cases}
-0, & e<50 \\
-0.02\times\min\left(1,\frac{e-50+1}{50}\right), & e\ge 50
+0,&e<50\\
+0.02\min\left(1,\frac{e-50+1}{50}\right),&e\ge50.
 \end{cases}
 \]
 
-| Epoch | `w_gan` | 含义 |
-|---|---:|---|
-| 0–49 | 0 | 仅分割损失，判别器不更新 |
-| 50 | 0.0004 | 开始渐进加入对抗约束 |
-| 74 | 0.0100 | 达到一半基础权重 |
-| 99 及以后 | 0.0200 | 使用完整 GAN 权重 |
-
-物理一致性权重同步升温：`w_phys(e)=0.1 × w_gan(e)/0.02`。例如 epoch 50 时为 `0.002`，epoch 74 时为 `0.05`，epoch 99 后为 `0.1`。
-
-## 5. 判别器损失：LSGAN + 物理一致性
-
-真实标签采用单侧平滑 `0.9`，生成标签为 `0`。令 `D_r`、`D_f` 为判别器最终 Patch 评分，`P_r`、`P_f` 为物理不一致图：
+生成器物理一致性权重与其同步升温：
 
 \[
-\mathcal{L}_{D}^{GAN} = \operatorname{MSE}(D_r, 0.9) + \operatorname{MSE}(D_f, 0)
+w_{phys}(e)=0.1\frac{w_{gan}(e)}{0.02}.
+\]
+
+在 LSGAN 下，D 的真实标签为 `0.9`（单侧标签平滑），Fake 标签为 `0`：
+
+\[
+\mathcal{L}_{D}^{GAN}=\operatorname{MSE}(D_r,0.9)+\operatorname{MSE}(D_f,0),
 \]
 
 \[
-\mathcal{L}_{D}^{phys} = \operatorname{MSE}(P_r, 0) + \operatorname{MSE}(P_f, 0.5)
+\mathcal{L}_{D}^{phys}=\operatorname{MSE}(P_r,0)+\operatorname{MSE}(P_f,0.5),
 \]
 
 \[
-\mathcal{L}_{D} = 1.0\mathcal{L}_{D}^{GAN} + 0.5\mathcal{L}_{D}^{phys}
+\mathcal{L}_{D}=1.0\mathcal{L}_{D}^{GAN}+0.5\mathcal{L}_{D}^{phys}.
 \]
 
-真实分割为标注转化得到的 5 通道 one-hot；生成分割使用 straight-through hard one-hot，使判别器前向看到同类数据表示，同时仍向生成器反传梯度。
-
-在 D 更新中，真实和生成样本的分割、Depth、IR 均加入标准差 `0.05` 的 instance noise；Depth/IR 随后裁剪至 `[0,1]`。这使 D 不会依赖过于精确的输入数值差异作为真假捷径。
-
-## 6. 生成器总损失
-
-生成器更新时判别器参数被冻结。对抗目标将生成样本判为真（目标为 1），物理目标将生成样本的物理不一致压向 0：
+G 的目标是使生成分割被判为真实且物理不一致趋近零：
 
 \[
 \mathcal{L}_{G}^{GAN}=\operatorname{MSE}(D_f,1),\qquad
-\mathcal{L}_{G}^{phys}=\operatorname{MSE}(P_f,0)
+\mathcal{L}_{G}^{phys}=\operatorname{MSE}(P_f,0),
 \]
 
 \[
-\mathcal{L}_{G}=\mathcal{L}_{seg}+w_{gan}(e)\mathcal{L}_{G}^{GAN}+w_{phys}(e)\mathcal{L}_{G}^{phys}
+\mathcal{L}_{G}=\mathcal{L}_{seg}+w_{gan}(e)\mathcal{L}_{G}^{GAN}+w_{phys}(e)\mathcal{L}_{G}^{phys}.
 \]
 
-其中物理一致性权重与 GAN 同步升温：
+Real 分割来自标签 one-hot；Fake 分割使用 straight-through hard one-hot：D 前向看到 argmax one-hot，反向梯度沿 softmax 传回 G。D 更新时，Real/Fake 分割与对应 Depth/IR 均添加 `std=0.05` instance noise；G 更新时仅 Fake 输入进入这一加噪路径。
 
-\[
-w_{phys}(e)=0.1\times\frac{w_{gan}(e)}{0.02}
-\]
+## 5. 优化与停止准则
 
-因此 epoch 0–49 时仅有 `L_seg`；epoch 99 后的完整权重为 `0.02`（GAN）和 `0.1`（物理一致性）。
-
-G 更新时，真实物理表征在无梯度模式下由真实 one-hot 分割获得；生成分割经 straight-through one-hot 和 instance noise 进入已冻结 D。D 的参数不更新，但其对生成分割的梯度会传回 G。
-
-## 7. 优化与学习率设置
-
-| 项目 | 生成器 | 判别器 |
+| 项目 | Generator | Discriminator |
 |---|---:|---:|
 | 优化器 | AdamW | AdamW |
 | 学习率 | `3e-4` | `1e-4` |
 | betas | `(0.5, 0.999)` | `(0.5, 0.999)` |
 | weight decay | `0.005` | `0.005` |
-| 更新比例 | 1 step | 1 step |
+| 学习率策略 | 5 epoch 线性 warmup + cosine 至 `5e-7` | 相同 |
 | 梯度裁剪 | L2 norm ≤ `2.0` | L2 norm ≤ `2.0` |
-| AMP | 启用 | 启用 |
 
-学习率策略为 5 个 epoch 的线性 warmup，之后执行余弦退火：`T_max=400`，最小学习率 `5e-7`。最大训练 epoch 为 400；验证每 epoch 一次，验证 mIoU 连续 100 次未提升时早停。
-
-推理阶段只执行 `Depth + IR → Generator → argmax`；不计算任何 GAN、物理一致性或判别器分支。
+最大训练 epoch 为 400；`val_freq=1`，即每个 epoch 验证一次；当前早停为验证 mIoU 连续 100 次不提升。最终推理只使用生成器：`Depth + IR → logits → argmax`，不计算任何对抗或物理分支。
