@@ -1,153 +1,147 @@
-# 生成器网络架构
+# 实验 11 生成器：DeepLabV3++GAN + RGST-TOFAA
 
-本文档描述当前消融实验 6--9 实际使用的生成器：`DeepLabV3Plus`（定义于 `models/deeplabv3plus.py`）。基础配置文件的默认 `generator_type` 仍是 `tof_physics`，但 `ablation_study.py` 会为实验 6--9 覆盖为 `deeplabv3plus`。
+本文仅描述实验 11 的实际生成器：`DeepLabV3Plus` + `ReliabilityGatedSemanticTOFAttention`（RGST-TOFAA）。训练时由 `ablation_study.py` 将生成器设置为 `deeplabv3plus`、`fusion_type=none`、`attention_type=reliability_gated_semantic_tofaa`。
 
-## 1. 输入、输出与配置
+## 模型规模
 
-| 项目 | 当前值 |
-|---|---|
-| 输入 | `B x 2 x H x W`，通道顺序 `[depth, IR]` |
-| 当前训练尺寸 | `H=576, W=640` |
-| 输出 | `B x 5 x H x W` 未归一化分割 logits |
-| 类别 | 背景、VMPET、PI、SCTP、BCC |
-| 主干 | ResNet-50 风格 bottleneck，block 数 `3, 4, 6, 3` |
-| 高层上下文 | ASPP，空洞率 `6, 12, 18` |
-| 解码器 | DeepLabV3+ 低层/高层特征融合 decoder |
-| 实验 6/7 | 不启用 TOFAA，参数量约 `40,344,933` |
-| 实验 8 | `material_aware_v2`，参数量约 `42,215,564` |
-| 实验 9 | `material_aware_v3`，参数量约 `42,344,236` |
+| 项目 | 数值 |
+|---|---:|
+| 输入 | `B x 2 x 576 x 640`，通道为 `[Depth, IR]` |
+| 输出 | `B x 5 x 576 x 640`，未归一化类别 logits |
+| 类别 | Background、VMPET、PI、SCTP、BCC |
+| 总参数量 | **41,094,343** |
+| FP32 参数存储 | **156.762 MiB** |
+| Backbone | 23,504,896 参数，89.664 MiB |
+| ASPP | 15,535,104 参数，59.262 MiB |
+| RGST-TOFAA | 749,410 参数，2.859 MiB |
+| Decoder | 1,304,933 参数，4.978 MiB |
 
-模型输出是 logits；训练损失接收 logits，推理时用 `argmax(dim=1)` 得到类别图。
+> 模型大小仅指可训练参数的 FP32 存储，不包含梯度、优化器状态和中间激活。
 
-```mermaid
-flowchart TD
-    A[Depth + IR\nB x 2 x 576 x 640] --> B[ResNet 风格 Backbone]
-    B --> C[低层 layer1\nB x 256 x 144 x 160]
-    B --> D[高层 layer4\nB x 2048 x 18 x 20]
-    D --> E[ASPP\nB x 256 x 18 x 20]
-    C --> F{TOFAA 是否启用}
-    E --> F
-    F --> G[增强后的低层特征\nB x 256 x 144 x 160]
-    G --> H[Decoder]
-    E --> H
-    H --> I[5 类 logits\nB x 5 x 576 x 640]
-```
+## 实验 11 生效配置
 
-## 2. Backbone：ResNet 风格特征提取
-
-输入 `B x 2 x 576 x 640` 时的实际尺度如下。
-
-| 阶段 | 结构 | 输出 |
+| 配置项 | 生效值 | 作用 |
 |---|---|---|
-| 输入 | depth、IR 拼接 | `B x 2 x 576 x 640` |
-| Stem | `7x7 Conv(2->64, stride=2) + BN + ReLU` | `B x 64 x 288 x 320` |
-| Pool | `3x3 MaxPool(stride=2)` | `B x 64 x 144 x 160` |
-| `layer1` | 3 个 bottleneck，首块 stride=1 | `B x 256 x 144 x 160` |
-| `layer2` | 4 个 bottleneck，首块 stride=2 | `B x 512 x 72 x 80` |
-| `layer3` | 6 个 bottleneck，首块 stride=2 | `B x 1024 x 36 x 40` |
-| `layer4` | 3 个 bottleneck，首块 stride=2 | `B x 2048 x 18 x 20` |
+| `generator_type` | `deeplabv3plus` | 选择本文件描述的生成器 |
+| `in_channels / out_channels` | `2 / 5` | 输入 Depth、IR；输出背景加 4 种材料 |
+| `fusion_type` | `none` | 不实例化 early / mid / late 物理融合支路 |
+| `use_attention` | `true` | 启用 RGST-TOFAA |
+| `attention_type` | `reliability_gated_semantic_tofaa` | 仅在 ASPP 后做高层语义校正 |
+| `tofaa_implementation_version` | `5` | 与 V2/V3/V4 checkpoint 隔离 |
+| `use_dropblock` | `false` | 不使用可选 DropBlock；ASPP/Decoder 自带的 `Dropout2d(0.1)` 仍保留 |
 
-每个 bottleneck 为：
+输入预处理后的 Depth 与 IR 均在 `[0,1]`：Depth 先乘 `0.02` m、裁剪到 `5.1` m 再归一化；IR 除以 `255` 后裁剪。生成器没有 sigmoid 或 softmax 输出层，训练损失直接接收 logits。
+
+## 整体结构与张量尺度
 
 ```text
-1x1 Conv(in -> mid) -> BN -> ReLU
--> 3x3 Conv(mid -> mid, stride=1/2) -> BN -> ReLU
--> 1x1 Conv(mid -> 4*mid) -> BN
--> 残差相加 -> ReLU
+Depth + IR (B x 2 x 576 x 640)
+        │
+        ▼
+ResNet-50-style Backbone
+        ├──────────────────────────────► layer1: B x 256 x 144 x 160 ──────┐
+        ▼                                                                  │
+layer4: B x 2048 x 18 x 20                                                 │
+        │                                                                  │
+        ▼                                                                  │
+ASPP: B x 256 x 18 x 20 → RGST-TOFAA: B x 256 x 18 x 20 ──────────────────┤
+                                                                           ▼
+                                                        DeepLabV3+ Decoder
+                                                                           │
+                                                                           ▼
+                                                   5-class logits: B x 5 x 576 x 640
 ```
 
-当通道数或空间尺度变化时，残差支路以 `1x1 Conv + BN` 投影对齐。`layer1` 的低层特征保留边界细节；`layer4` 的高层特征提供材料语义。
+## 1. ResNet 风格 Backbone
 
-## 3. ASPP：高层多尺度上下文
+| 阶段 | 结构 | 输出尺寸 |
+|---|---|---|
+| Stem | `7x7 Conv(2→64, s=2) + BN + ReLU` | `B x 64 x 288 x 320` |
+| Pool | `3x3 MaxPool(s=2)` | `B x 64 x 144 x 160` |
+| layer1 | 3 个 bottleneck | `B x 256 x 144 x 160` |
+| layer2 | 4 个 bottleneck，首块下采样 | `B x 512 x 72 x 80` |
+| layer3 | 6 个 bottleneck，首块下采样 | `B x 1024 x 36 x 40` |
+| layer4 | 3 个 bottleneck，首块下采样 | `B x 2048 x 18 x 20` |
 
-ASPP 输入 `B x 2048 x 18 x 20`，包含五个并行的 256 通道分支：
+每个 bottleneck 的主分支为 `1x1 Conv → BN → ReLU → 3x3 Conv → BN → ReLU → 1x1 Conv → BN`，再与恒等/`1x1 Conv + BN` 残差支路相加后 ReLU。四个 stage 的 bottleneck 中间通道分别为 `64 / 128 / 256 / 512`，输出通道按 expansion=4 变为 `256 / 512 / 1024 / 2048`。
 
-| 分支 | 操作 |
-|---|---|
-| 1 | `1x1 Conv(2048->256) + BN + ReLU` |
-| 2 | `3x3 Atrous Conv(2048->256, dilation=6) + BN + ReLU` |
-| 3 | `3x3 Atrous Conv(2048->256, dilation=12) + BN + ReLU` |
-| 4 | `3x3 Atrous Conv(2048->256, dilation=18) + BN + ReLU` |
-| 5 | 全局平均池化 -> `1x1 Conv(2048->256) + BN + ReLU` -> 双线性上采样 |
+实验 11 的 RGST-TOFAA **不修改** `layer1` 特征；该原始低层路径直接送入 Decoder，保留空间边界信息。
 
-五路输出拼接为 `B x 1280 x 18 x 20`，经：
+## 2. ASPP 高层语义提取
+
+输入为 `B x 2048 x 18 x 20`。五个并行分支均输出 256 通道：
+
+- `1x1 Conv`；
+- `3x3 Atrous Conv`，dilation = 6；
+- `3x3 Atrous Conv`，dilation = 12；
+- `3x3 Atrous Conv`，dilation = 18；
+- 全局平均池化 → `1x1 Conv` → 上采样。
+
+五路特征拼接为 1280 通道，经 `1x1 Conv(1280→256) + BN + ReLU + Dropout2d(0.1)`，得到 ASPP 特征 `F`：`B x 256 x 18 x 20`。
+
+| ASPP 子模块 | 参数量 |
+|---|---:|
+| `1x1` 分支 | 524,800 |
+| 3 个空洞卷积分支 | 14,157,312 |
+| 全局池化分支 | 524,800 |
+| 1280→256 融合层 | 328,192 |
+| 合计 | **15,535,104** |
+
+## 3. RGST-TOFAA：可靠性门控语义 TOF 聚合
+
+RGST-TOFAA 位于 ASPP 之后，仅校正高层语义；Depth 与 IR 被双线性下采样到 `18 x 20`。
 
 ```text
-1x1 Conv(1280->256) -> BN -> ReLU -> Dropout2d(p=0.1)
+Depth, IR, |∇Depth|, |∇IR|  (B x 4 x 18 x 20)
+            │
+            ▼
+TOF encoder: 3x3 Conv(4→32) → BN → ReLU → 3x3 Conv(32→32) → BN → ReLU
+            │  T: B x 32 x 18 x 20
+ASPP F ─────┴── concat ──► [F, T]: B x 288 x 18 x 20
+                              ├─ Reliability gate: 1x1 Conv(288→32→1) + Sigmoid → g
+                              └─ Semantic delta: 3x3 Conv(288→256) + BN + ReLU → 1x1 Conv(256→256) → ΔF
+
+F_out = F + tanh(α) × g × ΔF
 ```
 
-得到 `B x 256 x 18 x 20`。这个 `Dropout2d(0.1)` 是 ASPP 固有层，不等于可选的 `DropBlock2D`。
+其中 `g` 为逐像素可靠性门控图，尺寸 `B x 1 x 18 x 20`；`α` 是可学习标量，初始化为 0。因此训练开始时 `F_out = F`，实验 11 的原 Backbone、ASPP 和 Decoder 初始输出与实验 7 完全一致；仅当训练证明 TOF 校正有效时才逐渐引入 `ΔF`。
 
-## 4. Decoder：融合低层边界与高层语义
+有限差分梯度在水平方向和垂直方向分别计算相邻像素差的绝对值，再相加；右边界和下边界补零。因此 RGST 的 TOF 观测完全由当前 Depth/IR 输入导出，不使用材质标签或预测标签。
 
-| 路径 | 操作 | 输出 |
+| RGST 子模块 | 参数量 | 输出 |
+|---|---:|---|
+| TOF encoder | 10,496 | `T: B x 32 x 18 x 20` |
+| reliability gate | 9,313 | `g: B x 1 x 18 x 20` |
+| semantic delta | 729,600 | `ΔF: B x 256 x 18 x 20` |
+| 标量 `α` | 1 | 单个可学习尺度 |
+| 合计 | **749,410** | `F_out: B x 256 x 18 x 20` |
+
+`tanh(α)` 将残差全局尺度限制在 `(-1,1)`。由于 `α=0`，第一步仅 `α` 能通过非零的 `g×ΔF` 获得梯度；当其离开零后，门控和校正卷积分支才同时收到有效梯度。这一设计确保新模块不会在初始化时扰动实验 7 的分割路径。
+
+## 4. Decoder 与分类头
+
+| 路径 | 操作 | 输出尺寸 |
 |---|---|---|
-| 低层路径 | `1x1 Conv(256->48) + BN + ReLU` | `B x 48 x 144 x 160` |
-| 高层路径 | ASPP 输出上采样至 `144 x 160` | `B x 256 x 144 x 160` |
-| 融合 | 拼接为 304 通道 -> `3x3 Conv(304->256) + BN + ReLU + Dropout2d(0.1)` | `B x 256 x 144 x 160` |
-| 分类 | `3x3 Conv(256->256) + BN + ReLU -> 1x1 Conv(256->5)` | `B x 5 x 144 x 160` |
+| 低层路径 | `1x1 Conv(256→48) + BN + ReLU` | `B x 48 x 144 x 160` |
+| 高层路径 | `F_out` 上采样到 `144 x 160` | `B x 256 x 144 x 160` |
+| 融合 | 拼接 → `3x3 Conv(304→256) + BN + ReLU + Dropout2d(0.1)` | `B x 256 x 144 x 160` |
+| 分类头 | `3x3 Conv(256→256) + BN + ReLU → 1x1 Conv(256→5)` | `B x 5 x 144 x 160` |
 | 输出 | 双线性上采样 4 倍 | `B x 5 x 576 x 640` |
 
-## 5. TOFAA 可选分支
+推理时对 logits 使用 `argmax(dim=1)` 得到最终材质标签图。
 
-TOFAA 始终作用于 `layer1` 的低层特征，不直接处理最终 logits。
+| Decoder 子模块 | 参数量 |
+|---|---:|
+| 低层 `256→48` 投影 | 12,384 |
+| 低/高层融合卷积 | 700,928 |
+| `256→256→5` 分类头 | 591,621 |
+| 合计 | **1,304,933** |
 
-### 5.1 V2：实验 8 的 `material_aware_v2`
+## 5. 实际前向顺序
 
-输入：
+1. 输入 `x=[Depth,IR]` 经 Backbone 得到原始低层 `f_low` 与高层 `f_high`。
+2. `f_high` 经 ASPP 得到 `F`；原始 Depth、IR 下采样至 `18 x 20` 后与 `F` 一起进入 RGST-TOFAA，输出 `F_out`。
+3. **未经任何注意力改写的** `f_low` 经 `256→48` 投影；`F_out` 上采样至同一 `144 x 160` 尺度。
+4. 两路拼接、卷积融合、分类，再上采样 4 倍得到 5 类 logits。
 
-```text
-x       : B x 256 x 144 x 160
-depth   : B x 1   x 144 x 160
-IR      : B x 1   x 144 x 160
-```
-
-1. depth、IR 各经两层 `3x3 Conv + BN + ReLU`，得到各 16 通道特征。
-2. 拼接为 32 通道物理特征；`1x1 Conv(32->16->1) + Sigmoid` 生成物理门。
-3. 物理特征与 `x` 拼接为 288 通道，分别生成 ECA 通道注意力和空间注意力。
-4. 经 `3x3 Conv(288->256->256)` 融合为 `attended`。
-5. 残差门 `1x1 Conv(512->256->256) + Sigmoid` 控制写入量：
-
-```text
-y = x + attended * residual_gate(x, attended)
-```
-
-残差门最后一个卷积初始化为权重 0、偏置 -3，使训练初期为保守的小残差更新。
-
-### 5.2 V3：实验 9 的 `material_aware_v3`
-
-V3 在 V2 的 depth/IR 条件上增加 ASPP 语义条件：
-
-```text
-x        : B x 256 x 144 x 160
-depth,IR : B x 1   x 144 x 160
-semantic : B x 256 x 18 x 20  （ASPP 输出）
-```
-
-ASPP 语义先上采样到 `144 x 160`，再以 `1x1 Conv(256->32) + BN + ReLU` 压缩为 32 通道。它与 depth/IR 的 32 通道特征拼接为 64 通道条件，随后用于：
-
-- `1x1 Conv(64->32->1) + Sigmoid` 的物理-语义门；
-- `3x3 Conv(320->128) -> 7x7 Conv(128->1)` 的空间注意力；
-- ECA 通道注意力和 `1x1 Conv(320->256)` 投影；
-- `3x3 Conv(320->256->256)` 的融合分支；
-- 与 V2 相同的 `512->256->256` 残差门。
-
-因此 V3 的关键区别是：低层 TOF 信息不再单独决定注意力，而由高层材料语义共同调制。
-
-## 6. 当前消融中的生成器差异
-
-| 实验 | 生成器差异 |
-|---|---|
-| 6 | DeepLabV3+，不含 TOFAA、无传感器噪声 |
-| 7 | 与 6 相同的生成器；仅训练数据增加传感器噪声 |
-| 8 | 7 + TOFAA V2 |
-| 9 | 7 + TOFAA V3 |
-
-`fusion_type=none` 是当前 6--9 的实际设置：`TOFPhysicsModule`、`AttentionFusion` 的 early/mid/late 物理融合分支不会实例化。可选的 DropBlock 也未在 6--9 启用。
-
-## 7. 训练与推理职责
-
-- 生成器始终优化分割损失（Dice、Focal、Cross Entropy）。
-- 从 `gan_start_epoch=50` 开始，生成器额外接收 GAN 与物理一致性辅助梯度。
-- 推理时只使用生成器；判别器和 GAN 损失不参与推理。
-
+模型构造时 RGST-TOFAA 在 Backbone、ASPP 和 Decoder 后才实例化；这避免其参数初始化消耗随机数后改变实验 7 主干的同种子初始化。RGST-TOFAA 是生成器的一部分，训练和推理均会执行；判别器只在训练期使用。
